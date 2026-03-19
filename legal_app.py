@@ -425,7 +425,12 @@ def show_document_detail():
         st.markdown(f"**Due date:** {doc['DUE_DATE']}")
         st.markdown(f"**Created:** {doc['CREATED_AT']}")
 
-    if doc.get("STAGE_PATH"):
+    try:
+        stage_path = doc["STAGE_PATH"]
+    except (KeyError, AttributeError):
+        stage_path = None
+
+    if stage_path:
         file_name = doc["FILE_NAME"]
         tmp_dl = f"/tmp/dl_{file_name}"
         session.file.get(
