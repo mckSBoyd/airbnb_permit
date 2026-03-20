@@ -441,7 +441,8 @@ def show_document_detail():
         st.error("Document not found.")
         return
 
-    doc = doc[0]
+    # ✅ Convert Snowflake Row to dict
+    doc = doc[0].as_dict()
 
     if role != "LEGAL":
         is_submitter = doc["SUBMITTED_BY"] == user_id
@@ -457,15 +458,15 @@ def show_document_detail():
     with col1:
         st.markdown(f"### {doc['TITLE']}")
         st.caption(f"Type: {doc['DOCUMENT_TYPE']} | Status: {doc['STATUS']}")
-        st.markdown(f"**Description:** {doc['DESCRIPTION'] or 'N/A'}")
+        st.markdown(f"**Description:** {doc.get('DESCRIPTION') or 'N/A'}")
     with col2:
         st.markdown(f"**Department:** {doc['DEPARTMENT_NAME']}")
         st.markdown(f"**Submitted by:** {doc['SUBMITTER_NAME']}")
-        st.markdown(f"**Legal reviewer:** {doc['REVIEWER_NAME'] or 'Unassigned'}")
-        st.markdown(f"**Due date:** {doc['DUE_DATE']}")
-        st.markdown(f"**Created:** {doc['CREATED_AT']}")
+        st.markdown(f"**Legal reviewer:** {doc.get('REVIEWER_NAME') or 'Unassigned'}")
+        st.markdown(f"**Due date:** {doc.get('DUE_DATE')}")
+        st.markdown(f"**Created:** {doc.get('CREATED_AT')}")
 
-    # Fixed file download logic
+    # ✅ Now .get() works because doc is a dict
     if doc.get("FILE_NAME") and doc.get("STAGE_PATH"):
         file_name = doc["FILE_NAME"]
         try:
@@ -500,8 +501,9 @@ def show_document_detail():
     if dept_reviews:
         st.subheader("Department reviews")
         for dr in dept_reviews:
-            status_icon = "✓" if dr["STATUS"] == "COMPLETED" else "⏳"
-            st.markdown(f"{status_icon} **{dr['DEPARTMENT_NAME']}** - {dr['FULL_NAME']} - {dr['STATUS']}")
+            dr_dict = dr.as_dict()  # ✅ Convert each Row to dict
+            status_icon = "✓" if dr_dict["STATUS"] == "COMPLETED" else "⏳"
+            st.markdown(f"{status_icon} **{dr_dict['DEPARTMENT_NAME']}** - {dr_dict['FULL_NAME']} - {dr_dict['STATUS']}")
 
     st.divider()
 
@@ -525,10 +527,11 @@ def show_document_detail():
     )
 
     for c in comments:
-        is_legal = c["ROLE"] == "LEGAL"
+        c_dict = c.as_dict()  # ✅ Convert each Row to dict
+        is_legal = c_dict["ROLE"] == "LEGAL"
         label = "Legal" if is_legal else "Department"
-        st.markdown(f"**{c['FULL_NAME']}** ({label}) - {c['CREATED_AT']}")
-        st.markdown(f"> {c['COMMENT_TEXT']}")
+        st.markdown(f"**{c_dict['FULL_NAME']}** ({label}) - {c_dict['CREATED_AT']}")
+        st.markdown(f"> {c_dict['COMMENT_TEXT']}")
         st.markdown("")
 
     st.divider()
@@ -575,8 +578,7 @@ def show_document_detail():
                             f"SELECT COUNT(*) AS CNT FROM LEGAL_REVIEW.APP.DEPARTMENT_REVIEWS "
                             f"WHERE DOCUMENT_ID = {doc_id} AND STATUS = 'PENDING'"
                         )
-                        if pending and pending[0]["CNT"] == 0:
-                            # All dept reviews done, move to SUBMITTED
+                        if pending and pending[0].as_dict()["CNT"] == 0:
                             session.sql(
                                 f"UPDATE LEGAL_REVIEW.APP.DOCUMENTS "
                                 f"SET STATUS = 'SUBMITTED', UPDATED_AT = CURRENT_TIMESTAMP() "
@@ -618,7 +620,6 @@ def show_document_detail():
                             f"({doc_id}, '{escape_sql(dept_name)}', 'Legal', CURRENT_TIMESTAMP())"
                         ).collect()
                         
-                        # Change status back to SUBMITTED when department responds
                         session.sql(
                             f"UPDATE LEGAL_REVIEW.APP.DOCUMENTS SET STATUS = 'SUBMITTED', "
                             f"UPDATED_AT = CURRENT_TIMESTAMP() WHERE DOCUMENT_ID = {doc_id}"
@@ -653,7 +654,6 @@ def show_document_detail():
                     st.error(f"Error adding comment: {str(e)}")
     else:
         st.caption("This document review is complete.")
-
 
 def main():
     if "passwords_initialized" not in st.session_state:
