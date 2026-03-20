@@ -1,6 +1,7 @@
 import streamlit as st
 import hashlib
 import datetime
+import re
 from snowflake.snowpark.context import get_active_session
 from snowflake.snowpark import Session
 
@@ -21,20 +22,43 @@ def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
 
 
+def escape_sql(value):
+    """Escape single quotes for SQL string literals"""
+    if value is None:
+        return "NULL"
+    return str(value).replace("'", "''")
+
+
+def sanitize_filename(filename):
+    """Remove potentially dangerous characters from filename"""
+    return re.sub(r'[^\w\s\-\.]', '_', filename)
+
+
 def run_query(sql):
-    return session.sql(sql).collect()
+    try:
+        return session.sql(sql).collect()
+    except Exception as e:
+        st.error(f"Database error: {str(e)}")
+        return []
 
 
 def run_query_df(sql):
-    return session.sql(sql).to_pandas()
+    try:
+        return session.sql(sql).to_pandas()
+    except Exception as e:
+        st.error(f"Database error: {str(e)}")
+        return None
 
 
 def authenticate(username, password):
     pw_hash = hash_password(password)
+    # Use escaped values to prevent SQL injection
     rows = run_query(
         f"SELECT USER_ID, USERNAME, FULL_NAME, ROLE, DEPARTMENT_ID "
         f"FROM LEGAL_REVIEW.APP.USERS "
-        f"WHERE USERNAME = '{username}' AND PASSWORD_HASH = '{pw_hash}' AND IS_ACTIVE = TRUE"
+        f"WHERE USERNAME = '{escape_sql(username)}' "
+        f"AND PASSWORD_HASH = '{pw_hash}' "
+        f"AND IS_ACTIVE = TRUE"
     )
     if rows:
         return rows[0]
@@ -46,7 +70,9 @@ def init_passwords():
     for u in users:
         pw_hash = hash_password("city2026")
         session.sql(
-            f"UPDATE LEGAL_REVIEW.APP.USERS SET PASSWORD_HASH = '{pw_hash}' WHERE USERNAME = '{u['USERNAME']}'"
+            f"UPDATE LEGAL_REVIEW.APP.USERS "
+            f"SET PASSWORD_HASH = '{pw_hash}' "
+            f"WHERE USERNAME = '{escape_sql(u['USERNAME'])}'"
         ).collect()
 
 
@@ -122,6 +148,10 @@ def show_dashboard():
     df_status = run_query_df(
         "SELECT STATUS, COUNT(*) AS CNT FROM LEGAL_REVIEW.APP.DOCUMENTS GROUP BY STATUS"
     )
+    
+    if df_status is None or df_status.empty:
+        st.info("No documents in system yet.")
+        return
 
     status_map = {}
     for _, row in df_status.iterrows():
@@ -176,7 +206,7 @@ def show_dashboard():
         "FROM LEGAL_REVIEW.APP.REVIEW_TIME_LOG WHERE TO_PARTY = 'Legal' "
         "GROUP BY FROM_PARTY ORDER BY AVG_HOURS DESC"
     )
-    if not df_dept_time.empty:
+    if df_dept_time is not None and not df_dept_time.empty:
         st.bar_chart(df_dept_time.set_index("DEPARTMENT")["AVG_HOURS"])
 
     st.subheader("Legal team workload")
@@ -186,7 +216,7 @@ def show_dashboard():
         "JOIN LEGAL_REVIEW.APP.USERS u ON d.ASSIGNED_LEGAL_REVIEWER = u.USER_ID "
         "GROUP BY u.FULL_NAME, d.STATUS ORDER BY u.FULL_NAME"
     )
-    if not df_workload.empty:
+    if df_workload is not None and not df_workload.empty:
         pivot = df_workload.pivot_table(index="FULL_NAME", columns="STATUS", values="CNT", fill_value=0)
         st.dataframe(pivot, use_container_width=True)
 
@@ -214,7 +244,7 @@ def show_all_reviews():
         f"{where} ORDER BY d.CREATED_AT DESC"
     )
 
-    if df.empty:
+    if df is None or df.empty:
         st.info("No documents found.")
         return
 
@@ -251,11 +281,11 @@ def show_my_reviews():
             f"WHERE d.SUBMITTED_BY = {user_id} ORDER BY d.CREATED_AT DESC"
         )
 
-    if df.empty:
+    if df is None or df.empty:
         st.info("You have no reviews.")
         return
 
-    st.dataframe(df)
+    st.dataframe(df, use_container_width=True)
 
     selected_id = st.number_input("Enter document ID to view details", min_value=1, step=1)
     if st.button("View document"):
@@ -314,65 +344,75 @@ def show_submit_document():
             return
 
         legal_user_id = legal_options[assigned_to]
-        session.sql(
-            f"INSERT INTO LEGAL_REVIEW.APP.DOCUMENTS "
-            f"(TITLE, DESCRIPTION, DOCUMENT_TYPE, SUBMITTED_BY, DEPARTMENT_ID, "
-            f"ASSIGNED_LEGAL_REVIEWER, STATUS, DUE_DATE) VALUES "
-            f"('{title.replace(chr(39), chr(39)+chr(39))}', "
-            f"'{description.replace(chr(39), chr(39)+chr(39))}', "
-            f"'{doc_type}', {st.session_state['user_id']}, {dept_id}, "
-            f"{legal_user_id}, "
-            f"'{'DEPT_REVIEW' if dept_reviewers else 'SUBMITTED'}', "
-            f"'{due_date}')"
-        ).collect()
-
-        new_doc = run_query("SELECT MAX(DOCUMENT_ID) AS DOC_ID FROM LEGAL_REVIEW.APP.DOCUMENTS")
-        doc_id = new_doc[0]["DOC_ID"]
-
-        if uploaded_file is not None:
-            safe_name = f"doc_{doc_id}_{uploaded_file.name}"
-            tmp_path = f"/tmp/{safe_name}"
-            with open(tmp_path, "wb") as f:
-                f.write(uploaded_file.getbuffer())
-            session.file.put(
-                tmp_path,
-                "@LEGAL_REVIEW.APP.DOCUMENTS_STAGE",
-                auto_compress=False,
-                overwrite=True,
-            )
+        
+        try:
             session.sql(
-                f"UPDATE LEGAL_REVIEW.APP.DOCUMENTS "
-                f"SET FILE_NAME = '{safe_name}', "
-                f"STAGE_PATH = '@LEGAL_REVIEW.APP.DOCUMENTS_STAGE/{safe_name}' "
-                f"WHERE DOCUMENT_ID = {doc_id}"
+                f"INSERT INTO LEGAL_REVIEW.APP.DOCUMENTS "
+                f"(TITLE, DESCRIPTION, DOCUMENT_TYPE, SUBMITTED_BY, DEPARTMENT_ID, "
+                f"ASSIGNED_LEGAL_REVIEWER, STATUS, DUE_DATE) VALUES "
+                f"('{escape_sql(title)}', "
+                f"'{escape_sql(description)}', "
+                f"'{doc_type}', {st.session_state['user_id']}, {dept_id}, "
+                f"{legal_user_id}, "
+                f"'{'DEPT_REVIEW' if dept_reviewers else 'SUBMITTED'}', "
+                f"'{due_date}')"
             ).collect()
 
-        if initial_comment:
-            session.sql(
-                f"INSERT INTO LEGAL_REVIEW.APP.REVIEW_COMMENTS "
-                f"(DOCUMENT_ID, USER_ID, COMMENT_TEXT, COMMENT_TYPE) VALUES "
-                f"({doc_id}, {st.session_state['user_id']}, "
-                f"'{initial_comment.replace(chr(39), chr(39)+chr(39))}', 'SUBMISSION')"
-            ).collect()
+            new_doc = run_query("SELECT MAX(DOCUMENT_ID) AS DOC_ID FROM LEGAL_REVIEW.APP.DOCUMENTS")
+            doc_id = new_doc[0]["DOC_ID"]
 
-        session.sql(
-            f"INSERT INTO LEGAL_REVIEW.APP.REVIEW_TIME_LOG "
-            f"(DOCUMENT_ID, FROM_PARTY, TO_PARTY, SENT_AT) VALUES "
-            f"({doc_id}, '{dept_name}', 'Legal', CURRENT_TIMESTAMP())"
-        ).collect()
-
-        for dept_review_id, dept_review_name in dept_reviewers:
-            reviewer = run_query(
-                f"SELECT USER_ID FROM LEGAL_REVIEW.APP.USERS WHERE DEPARTMENT_ID = {dept_review_id} LIMIT 1"
-            )
-            if reviewer:
+            if uploaded_file is not None:
+                # Sanitize filename
+                safe_name = f"doc_{doc_id}_{sanitize_filename(uploaded_file.name)}"
+                tmp_path = f"/tmp/{safe_name}"
+                
+                with open(tmp_path, "wb") as f:
+                    f.write(uploaded_file.getbuffer())
+                
+                session.file.put(
+                    tmp_path,
+                    "@LEGAL_REVIEW.APP.DOCUMENTS_STAGE",
+                    auto_compress=False,
+                    overwrite=True,
+                )
+                
                 session.sql(
-                    f"INSERT INTO LEGAL_REVIEW.APP.DEPARTMENT_REVIEWS "
-                    f"(DOCUMENT_ID, DEPARTMENT_ID, REVIEWER_USER_ID, STATUS) VALUES "
-                    f"({doc_id}, {dept_review_id}, {reviewer[0]['USER_ID']}, 'PENDING')"
+                    f"UPDATE LEGAL_REVIEW.APP.DOCUMENTS "
+                    f"SET FILE_NAME = '{escape_sql(safe_name)}', "
+                    f"STAGE_PATH = '@LEGAL_REVIEW.APP.DOCUMENTS_STAGE/{escape_sql(safe_name)}' "
+                    f"WHERE DOCUMENT_ID = {doc_id}"
                 ).collect()
 
-        st.success(f"Document submitted successfully! Document ID: {doc_id}")
+            if initial_comment:
+                session.sql(
+                    f"INSERT INTO LEGAL_REVIEW.APP.REVIEW_COMMENTS "
+                    f"(DOCUMENT_ID, USER_ID, COMMENT_TEXT, COMMENT_TYPE) VALUES "
+                    f"({doc_id}, {st.session_state['user_id']}, "
+                    f"'{escape_sql(initial_comment)}', 'SUBMISSION')"
+                ).collect()
+
+            session.sql(
+                f"INSERT INTO LEGAL_REVIEW.APP.REVIEW_TIME_LOG "
+                f"(DOCUMENT_ID, FROM_PARTY, TO_PARTY, SENT_AT) VALUES "
+                f"({doc_id}, '{escape_sql(dept_name)}', 'Legal', CURRENT_TIMESTAMP())"
+            ).collect()
+
+            for dept_review_id, dept_review_name in dept_reviewers:
+                reviewer = run_query(
+                    f"SELECT USER_ID FROM LEGAL_REVIEW.APP.USERS "
+                    f"WHERE DEPARTMENT_ID = {dept_review_id} AND IS_ACTIVE = TRUE LIMIT 1"
+                )
+                if reviewer:
+                    session.sql(
+                        f"INSERT INTO LEGAL_REVIEW.APP.DEPARTMENT_REVIEWS "
+                        f"(DOCUMENT_ID, DEPARTMENT_ID, REVIEWER_USER_ID, STATUS) VALUES "
+                        f"({doc_id}, {dept_review_id}, {reviewer[0]['USER_ID']}, 'PENDING')"
+                    ).collect()
+
+            st.success(f"Document submitted successfully! Document ID: {doc_id}")
+            
+        except Exception as e:
+            st.error(f"Error submitting document: {str(e)}")
 
 
 def show_document_detail():
@@ -425,25 +465,28 @@ def show_document_detail():
         st.markdown(f"**Due date:** {doc['DUE_DATE']}")
         st.markdown(f"**Created:** {doc['CREATED_AT']}")
 
-    try:
-        stage_path = doc["STAGE_PATH"]
-    except (KeyError, AttributeError):
-        stage_path = None
-
-    if stage_path:
+    # Fixed file download logic
+    if doc.get("FILE_NAME") and doc.get("STAGE_PATH"):
         file_name = doc["FILE_NAME"]
-        tmp_dl = f"/tmp/dl_{file_name}"
-        session.file.get(
-            f"@LEGAL_REVIEW.APP.DOCUMENTS_STAGE/{file_name}",
-            "/tmp/",
-        )
-        with open(tmp_dl, "rb") as f:
-            file_bytes = f.read()
-        st.download_button(
-            label=f"Download: {file_name}",
-            data=file_bytes,
-            file_name=file_name,
-        )
+        try:
+            # Get file from stage
+            session.file.get(
+                f"@LEGAL_REVIEW.APP.DOCUMENTS_STAGE/{file_name}",
+                "/tmp/",
+            )
+            
+            # Read the downloaded file
+            tmp_dl = f"/tmp/{file_name}"
+            with open(tmp_dl, "rb") as f:
+                file_bytes = f.read()
+            
+            st.download_button(
+                label=f"Download: {file_name}",
+                data=file_bytes,
+                file_name=file_name,
+            )
+        except Exception as e:
+            st.error(f"Error downloading file: {str(e)}")
     else:
         st.caption("No file attached.")
 
@@ -457,7 +500,7 @@ def show_document_detail():
     if dept_reviews:
         st.subheader("Department reviews")
         for dr in dept_reviews:
-            status_icon = "+" if dr["STATUS"] == "COMPLETED" else "..."
+            status_icon = "✓" if dr["STATUS"] == "COMPLETED" else "⏳"
             st.markdown(f"{status_icon} **{dr['DEPARTMENT_NAME']}** - {dr['FULL_NAME']} - {dr['STATUS']}")
 
     st.divider()
@@ -467,7 +510,7 @@ def show_document_detail():
         f"FROM LEGAL_REVIEW.APP.REVIEW_TIME_LOG "
         f"WHERE DOCUMENT_ID = {doc_id} ORDER BY SENT_AT"
     )
-    if not time_logs.empty:
+    if time_logs is not None and not time_logs.empty:
         st.subheader("Review timeline")
         st.dataframe(time_logs, use_container_width=True)
 
@@ -512,71 +555,102 @@ def show_document_detail():
             if not new_comment:
                 st.error("Please enter a comment.")
             else:
-                session.sql(
-                    f"INSERT INTO LEGAL_REVIEW.APP.REVIEW_COMMENTS "
-                    f"(DOCUMENT_ID, USER_ID, COMMENT_TEXT, COMMENT_TYPE) VALUES "
-                    f"({doc_id}, {user_id}, "
-                    f"'{new_comment.replace(chr(39), chr(39)+chr(39))}', '{comment_type}')"
-                ).collect()
-
-                if comment_type == "DEPARTMENT_REVIEW":
+                try:
                     session.sql(
-                        f"UPDATE LEGAL_REVIEW.APP.DEPARTMENT_REVIEWS "
-                        f"SET STATUS = 'COMPLETED', COMPLETED_AT = CURRENT_TIMESTAMP() "
-                        f"WHERE DOCUMENT_ID = {doc_id} AND REVIEWER_USER_ID = {user_id}"
+                        f"INSERT INTO LEGAL_REVIEW.APP.REVIEW_COMMENTS "
+                        f"(DOCUMENT_ID, USER_ID, COMMENT_TEXT, COMMENT_TYPE) VALUES "
+                        f"({doc_id}, {user_id}, "
+                        f"'{escape_sql(new_comment)}', '{comment_type}')"
                     ).collect()
 
-                if role == "LEGAL" and comment_type == "LEGAL_FEEDBACK":
-                    session.sql(
-                        f"UPDATE LEGAL_REVIEW.APP.REVIEW_TIME_LOG "
-                        f"SET RESPONDED_AT = CURRENT_TIMESTAMP(), "
-                        f"DURATION_HOURS = TIMESTAMPDIFF(HOUR, SENT_AT, CURRENT_TIMESTAMP()) "
-                        f"WHERE DOCUMENT_ID = {doc_id} AND RESPONDED_AT IS NULL"
-                    ).collect()
+                    if comment_type == "DEPARTMENT_REVIEW":
+                        session.sql(
+                            f"UPDATE LEGAL_REVIEW.APP.DEPARTMENT_REVIEWS "
+                            f"SET STATUS = 'COMPLETED', COMPLETED_AT = CURRENT_TIMESTAMP() "
+                            f"WHERE DOCUMENT_ID = {doc_id} AND REVIEWER_USER_ID = {user_id}"
+                        ).collect()
+                        
+                        # Check if all department reviews are complete
+                        pending = run_query(
+                            f"SELECT COUNT(*) AS CNT FROM LEGAL_REVIEW.APP.DEPARTMENT_REVIEWS "
+                            f"WHERE DOCUMENT_ID = {doc_id} AND STATUS = 'PENDING'"
+                        )
+                        if pending and pending[0]["CNT"] == 0:
+                            # All dept reviews done, move to SUBMITTED
+                            session.sql(
+                                f"UPDATE LEGAL_REVIEW.APP.DOCUMENTS "
+                                f"SET STATUS = 'SUBMITTED', UPDATED_AT = CURRENT_TIMESTAMP() "
+                                f"WHERE DOCUMENT_ID = {doc_id}"
+                            ).collect()
 
-                    dept_name = doc["DEPARTMENT_NAME"]
-                    session.sql(
-                        f"INSERT INTO LEGAL_REVIEW.APP.REVIEW_TIME_LOG "
-                        f"(DOCUMENT_ID, FROM_PARTY, TO_PARTY, SENT_AT) VALUES "
-                        f"({doc_id}, 'Legal', '{dept_name}', CURRENT_TIMESTAMP())"
-                    ).collect()
+                    if role == "LEGAL" and comment_type == "LEGAL_FEEDBACK":
+                        session.sql(
+                            f"UPDATE LEGAL_REVIEW.APP.REVIEW_TIME_LOG "
+                            f"SET RESPONDED_AT = CURRENT_TIMESTAMP(), "
+                            f"DURATION_HOURS = TIMESTAMPDIFF(HOUR, SENT_AT, CURRENT_TIMESTAMP()) "
+                            f"WHERE DOCUMENT_ID = {doc_id} AND RESPONDED_AT IS NULL"
+                        ).collect()
 
-                    session.sql(
-                        f"UPDATE LEGAL_REVIEW.APP.DOCUMENTS SET STATUS = 'IN_REVIEW', "
-                        f"UPDATED_AT = CURRENT_TIMESTAMP() WHERE DOCUMENT_ID = {doc_id}"
-                    ).collect()
+                        dept_name = doc["DEPARTMENT_NAME"]
+                        session.sql(
+                            f"INSERT INTO LEGAL_REVIEW.APP.REVIEW_TIME_LOG "
+                            f"(DOCUMENT_ID, FROM_PARTY, TO_PARTY, SENT_AT) VALUES "
+                            f"({doc_id}, 'Legal', '{escape_sql(dept_name)}', CURRENT_TIMESTAMP())"
+                        ).collect()
 
-                elif role != "LEGAL" and comment_type == "DEPARTMENT_RESPONSE":
-                    session.sql(
-                        f"UPDATE LEGAL_REVIEW.APP.REVIEW_TIME_LOG "
-                        f"SET RESPONDED_AT = CURRENT_TIMESTAMP(), "
-                        f"DURATION_HOURS = TIMESTAMPDIFF(HOUR, SENT_AT, CURRENT_TIMESTAMP()) "
-                        f"WHERE DOCUMENT_ID = {doc_id} AND RESPONDED_AT IS NULL"
-                    ).collect()
+                        session.sql(
+                            f"UPDATE LEGAL_REVIEW.APP.DOCUMENTS SET STATUS = 'IN_REVIEW', "
+                            f"UPDATED_AT = CURRENT_TIMESTAMP() WHERE DOCUMENT_ID = {doc_id}"
+                        ).collect()
 
-                    dept_name = doc["DEPARTMENT_NAME"]
-                    session.sql(
-                        f"INSERT INTO LEGAL_REVIEW.APP.REVIEW_TIME_LOG "
-                        f"(DOCUMENT_ID, FROM_PARTY, TO_PARTY, SENT_AT) VALUES "
-                        f"({doc_id}, '{dept_name}', 'Legal', CURRENT_TIMESTAMP())"
-                    ).collect()
+                    elif role != "LEGAL" and comment_type == "DEPARTMENT_RESPONSE":
+                        session.sql(
+                            f"UPDATE LEGAL_REVIEW.APP.REVIEW_TIME_LOG "
+                            f"SET RESPONDED_AT = CURRENT_TIMESTAMP(), "
+                            f"DURATION_HOURS = TIMESTAMPDIFF(HOUR, SENT_AT, CURRENT_TIMESTAMP()) "
+                            f"WHERE DOCUMENT_ID = {doc_id} AND RESPONDED_AT IS NULL"
+                        ).collect()
 
-                elif comment_type == "APPROVAL":
-                    session.sql(
-                        f"UPDATE LEGAL_REVIEW.APP.REVIEW_TIME_LOG "
-                        f"SET RESPONDED_AT = CURRENT_TIMESTAMP(), "
-                        f"DURATION_HOURS = TIMESTAMPDIFF(HOUR, SENT_AT, CURRENT_TIMESTAMP()) "
-                        f"WHERE DOCUMENT_ID = {doc_id} AND RESPONDED_AT IS NULL"
-                    ).collect()
+                        dept_name = doc["DEPARTMENT_NAME"]
+                        session.sql(
+                            f"INSERT INTO LEGAL_REVIEW.APP.REVIEW_TIME_LOG "
+                            f"(DOCUMENT_ID, FROM_PARTY, TO_PARTY, SENT_AT) VALUES "
+                            f"({doc_id}, '{escape_sql(dept_name)}', 'Legal', CURRENT_TIMESTAMP())"
+                        ).collect()
+                        
+                        # Change status back to SUBMITTED when department responds
+                        session.sql(
+                            f"UPDATE LEGAL_REVIEW.APP.DOCUMENTS SET STATUS = 'SUBMITTED', "
+                            f"UPDATED_AT = CURRENT_TIMESTAMP() WHERE DOCUMENT_ID = {doc_id}"
+                        ).collect()
 
-                    session.sql(
-                        f"UPDATE LEGAL_REVIEW.APP.DOCUMENTS SET STATUS = 'COMPLETED', "
-                        f"COMPLETED_AT = CURRENT_TIMESTAMP(), UPDATED_AT = CURRENT_TIMESTAMP() "
-                        f"WHERE DOCUMENT_ID = {doc_id}"
-                    ).collect()
+                    elif comment_type == "APPROVAL":
+                        session.sql(
+                            f"UPDATE LEGAL_REVIEW.APP.REVIEW_TIME_LOG "
+                            f"SET RESPONDED_AT = CURRENT_TIMESTAMP(), "
+                            f"DURATION_HOURS = TIMESTAMPDIFF(HOUR, SENT_AT, CURRENT_TIMESTAMP()) "
+                            f"WHERE DOCUMENT_ID = {doc_id} AND RESPONDED_AT IS NULL"
+                        ).collect()
 
-                st.success("Comment added.")
-                st.rerun()
+                        session.sql(
+                            f"UPDATE LEGAL_REVIEW.APP.DOCUMENTS SET STATUS = 'COMPLETED', "
+                            f"COMPLETED_AT = CURRENT_TIMESTAMP(), UPDATED_AT = CURRENT_TIMESTAMP() "
+                            f"WHERE DOCUMENT_ID = {doc_id}"
+                        ).collect()
+                    
+                    elif comment_type == "REJECTION":
+                        session.sql(
+                            f"UPDATE LEGAL_REVIEW.APP.REVIEW_TIME_LOG "
+                            f"SET RESPONDED_AT = CURRENT_TIMESTAMP(), "
+                            f"DURATION_HOURS = TIMESTAMPDIFF(HOUR, SENT_AT, CURRENT_TIMESTAMP()) "
+                            f"WHERE DOCUMENT_ID = {doc_id} AND RESPONDED_AT IS NULL"
+                        ).collect()
+
+                    st.success("Comment added.")
+                    st.rerun()
+                    
+                except Exception as e:
+                    st.error(f"Error adding comment: {str(e)}")
     else:
         st.caption("This document review is complete.")
 
@@ -604,4 +678,5 @@ def main():
         show_document_detail()
 
 
-main()
+if __name__ == "__main__":
+    main()
