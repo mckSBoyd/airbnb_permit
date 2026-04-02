@@ -259,8 +259,8 @@ with h2:
 
     # Settings popover
     with hc3.popover("⚙️ Export Settings", use_container_width=True):
-        new_prefix = st.text_input("File Name Prefix", value=st.session_state.file_prefix)
-        new_sheet  = st.text_input("Sheet Tab Name",   value=st.session_state.sheet_name)
+        new_prefix = st.text_input("File Name Prefix", value=st.session_state.file_prefix, key="header_prefix")
+        new_sheet  = st.text_input("Sheet Tab Name",   value=st.session_state.sheet_name,  key="header_sheet")
         st.caption(f"Saves as: `{new_prefix or 'call_log'}_{date.today()}.xlsx`")
         if st.button("Save", type="primary"):
             st.session_state.file_prefix = new_prefix or "call_log"
@@ -595,9 +595,9 @@ with tab_cfg:
     st.subheader("⚙️ Export Settings")
     s1, s2, s3 = st.columns([2, 2, 1])
     new_prefix = s1.text_input("File Name Prefix",
-                                value=st.session_state.file_prefix)
+                                value=st.session_state.file_prefix, key="cfg_prefix")
     new_sheet  = s2.text_input("Sheet Tab Name",
-                                value=st.session_state.sheet_name)
+                                value=st.session_state.sheet_name,  key="cfg_sheet")
     s3.write("")
     s3.write("")
     if s3.button("💾 Save", use_container_width=True):
